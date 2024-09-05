@@ -23,3 +23,29 @@ varHoverFill If (varAppColorMode = "Dark", RGBA(255, 255, 255,0.1), RGBA(0,0,0,0
 varPressedFill
 
 // set Icons
+=======================================================================================================================
+Table(
+
+MenuIcon: "<svg xmlns='http://www.w3.org/2000/svg" width='16' height='16' fill='currentColor' class='bi bi-bucket' viewBox="0 0 16 15'> <path d="M2.522 5H28.5.5 0 0 0.494.57411.372 9.14941.5 1.5 0 0 0 4.36 16h7.278a1.5 1.5 0 0 0 1.483-1.27711.373-9.1494.5.5 0 0 0 14 Sh-.52245.5 5.5 0 0 0 2.522 5zm1.005 0a4.5 4.5 0 0 1 8.945 0H3.527zm9.892 1-1.286 8.5748.5.5 8 8 1-494.426H4.368.5.5 0 0 1-494-426L2.58 6h10.838z'/>
+
+</svg>",
+
+MenuID: 1,
+
+MenuName: "Products",
+
+PageNavigation: App.ActiveScreen
+
+MenuIcon: "<svg xmlns='http://www.w3.org/2000/svg" width='16' height='16' fill='currentColor' class='bi bi-bucket' viewBox="0 0 16 16'> <path d="M2.522 5H2a.5.5 0 0 0.494.57411.372 9.14941.5 1.5 0 0 0 4.36 16h7.278a1.5 1.5 000 1.483-1.27711.373-9.1494.5.5 0 0 0 14 5h-52245.5 5.5 0 0 0 2.522 Szm1.005 8a4.5 4.5 0 0 1 8.945 0H3.527zm9.892 1-1.286 8.574a.5.5 8 8 1.494.426H4.368.5.5 8 0 1-494-426L2.58 6h10.8382'/>
+
+</svg>",
+
+MenuID: 2,
+
+MenuName: "Appointments",
+
+PageNavigation: App.ActiveScreen
+
+}
+
+MenuIcon: "<svg xmlns='http://www.w3.org/2000/svg" width='16' height="16" fill='currentColor' class='bi bi-bucket' viewBox='0 8 16 16'> <path d="M2.522 5H23.5.5 0 0 0.494.57411.372 9.14941.5 1.5 0 0 0 4.36 16h7.278a1.5 1.5 0 0 0 1.483-1.27711.373-9.1494.5.5 e e e 14 5h--52245.5 5.5 0 0 0 2.522 5zm1.005 0a4.5 4.5 0 0 1 8.945 0H3.527zm9.892 1-1.286 8.5748.5.5 0 8 1.494.426H4.362.5.5 8 0 1-494-426L2.58 6h10.8382'/>
