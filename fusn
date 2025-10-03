@@ -104,3 +104,55 @@ for each in fusion_objects:
             "container": each['container']
         }
     )
+================================================================
+from concurrent.futures import ThreadPoolExecutor
+import traceback
+
+# Fetch all fusion objects
+fusion_objects = spark.sql("""
+    SELECT * 
+    FROM eeplatform_master_catalog.eeplatform_master_config.fusion_config
+""").collect()
+
+def run_fusion_notebook(each):
+    try:
+        result = dbutils.notebook.run(
+            "fusion_ingest_object",  # your parameterized notebook
+            0,  # timeout_seconds = 0 means no limit
+            arguments={
+                "object_name": each['object_name'],
+                "source": each['source'],
+                "raw_schema_json": each['raw_schema_json'],
+                "processed_schema_json": each['processed_schema_json'],
+                "gold_schema_json": each['gold_schema_json'],
+                "query": each['query'],
+                "priority_columns": each['priority_columns'],
+                "raw_base": each['raw_base'],
+                "processed_base_path": each['processed_base_path'],
+                "reports_base_path": each['reports_base_path'],
+                "raw_catalog": each['raw_catalog'],
+                "raw_schema": each['raw_schema'],
+                "raw_table": each['raw_table'],
+                "processed_catalog": each['processed_catalog'],
+                "processed_schema": each['processed_schema'],
+                "processed_table": each['processed_table'],
+                "reports_catalog": each['reports_catalog'],
+                "reports_schema": each['reports_schema'],
+                "reports_table": each['reports_table'],
+                "storage_act_name": each['storage_act_name'],
+                "container": each['container']
+            }
+        )
+        print(f"[SUCCESS] {each['object_name']} | Result: {result}")
+        return each['object_name'], "SUCCESS"
+    except Exception as e:
+        print(f"[FAILED] {each['object_name']} | Error: {e}")
+        traceback.print_exc()
+        return each['object_name'], "FAILED"
+
+# Execute notebooks in parallel
+max_threads = 5  # adjust based on cluster size and resources
+with ThreadPoolExecutor(max_workers=max_threads) as executor:
+    results = list(executor.map(run_fusion_notebook, fusion_objects))
+
+print("Fusion notebook execution results:", results)
