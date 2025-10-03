@@ -1,0 +1,106 @@
+# Create widgets for parameters
+dbutils.widgets.text("object_name", "")
+dbutils.widgets.text("source", "")
+dbutils.widgets.text("raw_schema_json", "")
+dbutils.widgets.text("processed_schema_json", "")
+dbutils.widgets.text("gold_schema_json", "")
+dbutils.widgets.text("query", "")
+dbutils.widgets.text("priority_columns", "")
+dbutils.widgets.text("raw_base", "")
+dbutils.widgets.text("processed_base_path", "")
+dbutils.widgets.text("reports_base_path", "")
+dbutils.widgets.text("raw_catalog", "")
+dbutils.widgets.text("raw_schema", "")
+dbutils.widgets.text("raw_table", "")
+dbutils.widgets.text("processed_catalog", "")
+dbutils.widgets.text("processed_schema", "")
+dbutils.widgets.text("processed_table", "")
+dbutils.widgets.text("reports_catalog", "")
+dbutils.widgets.text("reports_schema", "")
+dbutils.widgets.text("reports_table", "")
+dbutils.widgets.text("storage_act_name", "")
+dbutils.widgets.text("container", "")
+
+
+object_name = dbutils.widgets.get("object_name")
+source = dbutils.widgets.get("source")
+raw_schema_json = dbutils.widgets.get("raw_schema_json")
+processed_schema_json = dbutils.widgets.get("processed_schema_json")
+gold_schema_json = dbutils.widgets.get("gold_schema_json")
+query = dbutils.widgets.get("query")
+priority_columns = dbutils.widgets.get("priority_columns").split(",")
+raw_base = dbutils.widgets.get("raw_base")
+processed_base_path = dbutils.widgets.get("processed_base_path")
+reports_base_path = dbutils.widgets.get("reports_base_path")
+raw_catalog = dbutils.widgets.get("raw_catalog")
+raw_schema = dbutils.widgets.get("raw_schema")
+raw_table = dbutils.widgets.get("raw_table")
+processed_catalog = dbutils.widgets.get("processed_catalog")
+processed_schema = dbutils.widgets.get("processed_schema")
+processed_table = dbutils.widgets.get("processed_table")
+reports_catalog = dbutils.widgets.get("reports_catalog")
+reports_schema = dbutils.widgets.get("reports_schema")
+reports_table = dbutils.widgets.get("reports_table")
+storage_act_name = dbutils.widgets.get("storage_act_name")
+container = dbutils.widgets.get("container")
+
+from constants import FusionConstants
+from fusion import FusionlakeHousePipeline
+from config import SecretsConfig
+
+sc = SecretsConfig(spark)
+config = FusionConstants(sc.pfx_file, sc.password, sc.client_id, sc.tenant_id, sc.base_url, 
+                         sc.query_url, sc.audience, sc.assertion_type, sc.grant_type, sc.scope, sc.subscription_key)
+
+print(f"Ingesting data to raw layer for {object_name}")
+FusionLakeHousePipeline(spark, config).raw_layer_ingestion(
+    container, storage_act_name, raw_catalog, raw_schema, raw_table, raw_base,
+    query, raw_schema_json, object_name
+)
+
+print(f"Ingesting data to processed layer for {object_name}")
+FusionLakeHousePipeline(spark, config).target_layer_ingestion(
+    container, storage_act_name, raw_catalog, raw_schema, raw_table,
+    raw_base, object_name, processed_catalog, processed_schema, processed_table,
+    processed_base_path, processed_schema_json, priority_columns=priority_columns
+)
+
+print(f"Ingesting data to reports layer for {object_name}")
+FusionLakeHousePipeline(spark, config).target_layer_ingestion(
+    container, storage_act_name, processed_catalog, processed_schema, processed_table,
+    processed_base_path, object_name, reports_catalog, reports_schema, reports_table,
+    reports_base_path, processed_schema_json
+)
+fusion_objects = spark.sql("""
+    SELECT * 
+    FROM eeplatform_master_catalog.eeplatform_master_config.fusion_config
+""").collect()
+
+for each in fusion_objects:
+    dbutils.notebook.run(
+        "fusion_ingest_object",  # your parameterized notebook
+        0,  # timeout
+        arguments={
+            "object_name": each['object_name'],
+            "source": each['source'],
+            "raw_schema_json": each['raw_schema_json'],
+            "processed_schema_json": each['processed_schema_json'],
+            "gold_schema_json": each['gold_schema_json'],
+            "query": each['query'],
+            "priority_columns": each['priority_columns'],
+            "raw_base": each['raw_base'],
+            "processed_base_path": each['processed_base_path'],
+            "reports_base_path": each['reports_base_path'],
+            "raw_catalog": each['raw_catalog'],
+            "raw_schema": each['raw_schema'],
+            "raw_table": each['raw_table'],
+            "processed_catalog": each['processed_catalog'],
+            "processed_schema": each['processed_schema'],
+            "processed_table": each['processed_table'],
+            "reports_catalog": each['reports_catalog'],
+            "reports_schema": each['reports_schema'],
+            "reports_table": each['reports_table'],
+            "storage_act_name": each['storage_act_name'],
+            "container": each['container']
+        }
+    )
