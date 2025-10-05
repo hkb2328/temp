@@ -156,3 +156,72 @@ with ThreadPoolExecutor(max_workers=max_threads) as executor:
     results = list(executor.map(run_fusion_notebook, fusion_objects))
 
 print("Fusion notebook execution results:", results)
+
+import logging
+from datetime import datetime
+from pyspark.sql import Row, SparkSession
+
+class DatabricksLogger:
+    def __init__(self, name, delta_path=None, file_path=None):
+        """
+        name: Logger name
+        delta_path: Delta table path for structured logs
+        file_path: File path to store logs
+        """
+        self.delta_path = delta_path
+        self.file_path = file_path
+        self.spark = SparkSession.builder.getOrCreate()
+        
+        # Setup Python logging
+        self.logger = logging.getLogger(name)
+        self.logger.setLevel(logging.INFO)
+        
+        # Console handler
+        console_handler = logging.StreamHandler()
+        console_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+        console_handler.setFormatter(console_formatter)
+        self.logger.addHandler(console_handler)
+        
+        # File handler if provided
+        if self.file_path:
+            file_handler = logging.FileHandler(self.file_path)
+            file_handler.setFormatter(console_formatter)
+            self.logger.addHandler(file_handler)
+    
+    def log(self, stage, level, message):
+        """
+        stage: stage of the pipeline e.g., 'API_FETCH', 'MERGE'
+        level: 'INFO', 'WARNING', 'ERROR'
+        message: log message
+        """
+        # Log to console/file
+        log_func = getattr(self.logger, level.lower(), self.logger.info)
+        log_func(f"[{stage}] {message}")
+        
+        # Log to Delta table if path provided
+        if self.delta_path:
+            try:
+                log_df = self.spark.createDataFrame([
+                    Row(timestamp=datetime.now(), stage=stage, level=level, message=message)
+                ])
+                log_df.write.format("delta").mode("append").save(self.delta_path)
+            except Exception as e:
+                self.logger.warning(f"Failed to log to Delta: {e}")
+    
+    # Convenience methods
+    def info(self, stage, message):
+        self.log(stage, "INFO", message)
+    def warning(self, stage, message):
+        self.log(stage, "WARNING", message)
+    def error(self, stage, message):
+        self.log(stage, "ERROR", message)
+
+
+log_delta_path = "/mnt/logs/pipeline_log_delta"
+log_file_path = "/dbfs/mnt/logs/pipeline.log"
+
+logger = DatabricksLogger("my_pipeline", delta_path=log_delta_path, file_path=log_file_path)
+logger.info("API_FETCH", "Fetched 2500 rows from Salesforce API")
+logger.warning("DELTA_MERGE", "Schema mismatch in column 'customer_city'")
+logger.error("DATA_VALIDATION", "Invalid records found: 25 rows")
+
