@@ -1,0 +1,108 @@
+from pyspark.sql import SparkSession
+
+class RLSPolicyDeployer:
+    """
+    Databricks Unity Catalog RLS Policy Deployment Utility
+
+    This class deploys centralized row-level security (RLS) policies across multiple catalogs.
+    It creates a security schema, a group-based access function, and a row filter policy per catalog.
+
+    Example:
+        deployer = RLSPolicyDeployer(
+            catalogs=["raw", "finance", "sales"],
+            allowed_group="raw_readers"
+        )
+        deployer.deploy_all(apply_to_raw_tables=True)
+    """
+
+    def __init__(self, catalogs, allowed_group, spark=None):
+        """
+        Initialize the RLS Policy Deployer.
+
+        Args:
+            catalogs (list[str]): List of catalogs to deploy to (excluding master_metadata_catalog)
+            allowed_group (str): Unity Catalog group name allowed to read raw data
+            spark (SparkSession, optional): Spark session. If None, auto-creates.
+        """
+        self.catalogs = catalogs
+        self.allowed_group = allowed_group
+        self.spark = spark or SparkSession.builder.getOrCreate()
+
+    def _create_security_schema(self, catalog):
+        """Create security schema if not exists."""
+        self.spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog}.security")
+        print(f"✅ Created/verified schema: {catalog}.security")
+
+    def _create_function(self, catalog):
+        """Create or replace the security function."""
+        sql = f"""
+        CREATE OR REPLACE FUNCTION {catalog}.security.fn_allow_raw_access()
+        RETURN is_account_group_member('{self.allowed_group}');
+        """
+        self.spark.sql(sql)
+        print(f"✅ Created function in {catalog}.security.fn_allow_raw_access()")
+
+    def _create_policy(self, catalog):
+        """Create or replace the row filter policy."""
+        sql = f"""
+        CREATE OR REPLACE ROW FILTER POLICY {catalog}.security.raw_access_policy
+        AS ({catalog}.security.fn_allow_raw_access())
+        ON TABLE {catalog}.raw.*
+        APPLIES TO (SELECT);
+        """
+        try:
+            self.spark.sql(sql)
+            print(f"✅ Created row filter policy in {catalog}.security.raw_access_policy")
+        except Exception as e:
+            # Some SQL engines may not support applying policy to * (wildcard)
+            print(f"⚠️ Skipping wildcard apply for {catalog}: {str(e)}")
+
+    def _apply_policy_to_raw_tables(self, catalog):
+        """Apply policy to all tables under {catalog}.raw."""
+        try:
+            tables = self.spark.sql(f"SHOW TABLES IN {catalog}.raw").collect()
+        except Exception:
+            print(f"⚠️ Skipping table listing for {catalog}.raw (schema may not exist)")
+            return
+
+        for row in tables:
+            table_name = row["tableName"]
+            try:
+                self.spark.sql(
+                    f"ALTER TABLE {catalog}.raw.{table_name} "
+                    f"SET ROW FILTER POLICY {catalog}.security.raw_access_policy"
+                )
+                print(f"🔒 Policy applied to {catalog}.raw.{table_name}")
+            except Exception as e:
+                print(f"⚠️ Could not apply policy to {catalog}.raw.{table_name}: {str(e)}")
+
+    def deploy_catalog(self, catalog, apply_to_raw_tables=False):
+        """Deploy policy to a single catalog."""
+        print(f"\n📦 Deploying RLS to catalog: {catalog}")
+        self._create_security_schema(catalog)
+        self._create_function(catalog)
+        self._create_policy(catalog)
+        if apply_to_raw_tables:
+            self._apply_policy_to_raw_tables(catalog)
+        print(f"✅ Deployment complete for catalog: {catalog}")
+
+    def deploy_all(self, apply_to_raw_tables=False):
+        """Deploy policies to all catalogs in the list."""
+        for catalog in self.catalogs:
+            self.deploy_catalog(catalog, apply_to_raw_tables=apply_to_raw_tables)
+        print("\n🎯 RLS policy deployment completed for all catalogs.")
+
+
+=========================================================
+from deploy_rls_policies import RLSPolicyDeployer
+
+# Initialize
+deployer = RLSPolicyDeployer(
+    catalogs=["raw", "finance", "sales"],   # catalogs to target
+    allowed_group="raw_readers"             # Unity Catalog group with read access
+)
+
+# Deploy policies across all catalogs and attach to raw tables
+deployer.deploy_all(apply_to_raw_tables=True)
+
+===========
