@@ -119,3 +119,16 @@ with mlflow.start_run(run_name="unity_catalog_rag_run"):
     mlflow.log_text(llm_output, "llm_response.txt")
 
 print(f"✅ Logged RAG run to MLflow experiment: {EXPERIMENT_PATH}")
+====================
+
+SELECT 
+  concat(c.catalog_name, '.', c.schema_name, '.', c.table_name) as full_table_name,
+  t.table_comment,
+  collect_list(named_struct('column_name', c.column_name, 'data_type', c.data_type, 'comment', c.comment)) as columns
+FROM system.information_schema.columns c
+LEFT JOIN system.information_schema.tables t
+  ON c.catalog_name = t.catalog_name 
+  AND c.schema_name = t.schema_name 
+  AND c.table_name = t.table_name
+WHERE c.catalog_name = '{CATALOG}'
+GROUP BY c.catalog_name, c.schema_name, c.table_name, t.table_comment
