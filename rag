@@ -1,0 +1,121 @@
+# Databricks notebook or .py file
+# ======================================================
+# RAG over Unity Catalog Metadata using Vector Search + MLflow
+# ======================================================
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, udf
+from pyspark.sql.types import StringType
+from databricks.vector_search.client import VectorSearchClient
+from databricks.sdk import WorkspaceClient
+import mlflow
+
+# ------------------------------------------------------
+# 1. CONFIGURATION
+# ------------------------------------------------------
+CATALOG = "your_catalog_name"             # replace with your Unity Catalog name
+CORPUS_TABLE = f"{CATALOG}.metadata_corpus"
+INDEX_NAME = f"{CATALOG}.metadata_index"
+EMBEDDING_MODEL = "databricks-bge-large-en"
+LLM_ENDPOINT = "databricks-dbrx-instruct"
+EXPERIMENT_PATH = "/Shared/metadata_rag"
+
+spark = SparkSession.builder.getOrCreate()
+
+# ------------------------------------------------------
+# 2. EXTRACT METADATA FROM UNITY CATALOG
+# ------------------------------------------------------
+metadata_df = spark.sql(f"""
+SELECT 
+  concat(c.catalog_name, '.', c.schema_name, '.', c.table_name) as full_table_name,
+  t.table_comment,
+  collect_list(named_struct('column_name', c.column_name, 'data_type', c.data_type, 'comment', c.comment)) as columns
+FROM system.information_schema.columns c
+LEFT JOIN system.information_schema.tables t
+  ON c.catalog_name = t.catalog_name 
+  AND c.schema_name = t.schema_name 
+  AND c.table_name = t.table_name
+WHERE c.catalog_name = '{CATALOG}'
+GROUP BY c.catalog_name, c.schema_name, c.table_name, t.table_comment
+""")
+
+# ------------------------------------------------------
+# 3. FORMAT INTO TEXT CORPUS
+# ------------------------------------------------------
+def format_metadata(row):
+    cols = "\n".join([f"- {c['column_name']} ({c['data_type']}): {c['comment'] or 'No description'}" for c in row.columns])
+    return f"Table: {row.full_table_name}\nDescription: {row.table_comment or 'No description'}\nColumns:\n{cols}"
+
+format_udf = udf(format_metadata, StringType())
+
+text_df = metadata_df.withColumn("text", format_udf(col("*"))).select("full_table_name", "text")
+
+# Save corpus as managed Delta table
+text_df.write.mode("overwrite").saveAsTable(CORPUS_TABLE)
+print(f"✅ Metadata corpus saved as table: {CORPUS_TABLE}")
+
+# ------------------------------------------------------
+# 4. CREATE / REFRESH VECTOR SEARCH INDEX
+# ------------------------------------------------------
+vs_client = VectorSearchClient()
+
+try:
+    index = vs_client.get_index(INDEX_NAME)
+    print(f"ℹ️  Existing index found: {INDEX_NAME}")
+except Exception:
+    print(f"🆕 Creating new vector search index: {INDEX_NAME}")
+    index = vs_client.create_index(
+        name=INDEX_NAME,
+        source_table_name=CORPUS_TABLE,
+        embedding_model_endpoint_name=EMBEDDING_MODEL
+    )
+
+index.refresh()
+print(f"✅ Vector index refreshed using model: {EMBEDDING_MODEL}")
+
+# ------------------------------------------------------
+# 5. QUERY USING RAG (LLM + VECTOR SEARCH)
+# ------------------------------------------------------
+query = "Which tables contain customer or account data?"
+
+results = index.similarity_search(query, k=3)
+context = "\n\n".join([r['text'] for r in results])
+
+prompt = f"""
+You are a data assistant with knowledge of Unity Catalog metadata.
+
+Using the following metadata:
+{context}
+
+Question: {query}
+Answer concisely and point out the relevant tables.
+"""
+
+w = WorkspaceClient()
+response = w.serving_endpoints.query(
+    LLM_ENDPOINT,
+    {
+        "inputs": [
+            {"role": "user", "content": prompt}
+        ]
+    }
+)
+
+llm_output = response.output[0].content[0].text
+print("🧠 LLM Response:")
+print(llm_output)
+
+# ------------------------------------------------------
+# 6. LOG WITH MLFLOW
+# ------------------------------------------------------
+mlflow.set_experiment(EXPERIMENT_PATH)
+
+with mlflow.start_run(run_name="unity_catalog_rag_run"):
+    mlflow.log_param("catalog", CATALOG)
+    mlflow.log_param("embedding_model", EMBEDDING_MODEL)
+    mlflow.log_param("llm_endpoint", LLM_ENDPOINT)
+    mlflow.log_text(query, "query.txt")
+    mlflow.log_text(context, "retrieved_context.txt")
+    mlflow.log_text(llm_output, "llm_response.txt")
+
+print(f"✅ Logged RAG run to MLflow experiment: {EXPERIMENT_PATH}")
