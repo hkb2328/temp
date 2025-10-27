@@ -271,3 +271,48 @@ def ingest_pdfs_to_bronze(pdf_base_path: str, bronze_table: str):
 
     print(f"✅ Bronze table {bronze_table} created successfully from {pdf_base_path}.")
 
+=======================================================================================================================================================================
+from pyspark.sql import functions as F, types as T
+
+def create_silver_from_bronze_single_pdf(bronze_table: str, silver_table: str):
+    # Read the one PDF's text directly
+    bronze_df = spark.table(bronze_table).select("path", "raw_text", "ingest_ts").limit(1)
+    pdf_row = bronze_df.collect()[0]
+    path = pdf_row["path"]
+    text = pdf_row["raw_text"]
+    ingest_ts = pdf_row["ingest_ts"]
+
+    # Simple chunking in Python
+    def chunk_text(text, chunk_size=1000, overlap=200):
+        if not text:
+            return []
+        text = "\n".join([ln.strip() for ln in text.splitlines() if ln.strip()])
+        chunks = []
+        start = 0
+        while start < len(text):
+            end = min(start + chunk_size, len(text))
+            chunks.append(text[start:end])
+            start = end - overlap
+            if start < 0:
+                start = 0
+        return chunks
+
+    chunks = chunk_text(text)
+
+    # Convert back to Spark DataFrame
+    rows = [(path, i, c, ingest_ts) for i, c in enumerate(chunks)]
+    schema = T.StructType([
+        T.StructField("path", T.StringType()),
+        T.StructField("chunk_index", T.IntegerType()),
+        T.StructField("chunk_text", T.StringType()),
+        T.StructField("ingest_ts", T.TimestampType())
+    ])
+    silver_df = spark.createDataFrame(rows, schema)
+
+    # Add metadata
+    silver_final = silver_df.withColumn("source_id", F.sha2(F.col("path"), 256)) \
+        .withColumn("doc_chunk_id", F.concat(F.col("source_id"), F.lit("_"), F.col("chunk_index"))) \
+        .withColumn("chunk_len", F.length(F.col("chunk_text")))
+
+    silver_final.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(silver_table)
+    print(f"✅ Silver table {silver_table} created successfully (single PDF mode).")
