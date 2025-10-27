@@ -244,3 +244,30 @@ Please give a concise, factual answer based only on the provided context.
 # 2. Uses databricks-bge-large-en for embeddings, databricks-dbrx-instruct for generation.
 # 3. Works with Delta + Vector Search for scalable retrieval.
 # 4. Ideal for enterprise knowledge base Q&A over PDFs.
+====================================================================================================================================
+def ingest_pdfs_to_bronze(pdf_base_path: str, bronze_table: str):
+    # Read binary files directly from ADLS using Spark
+    pdf_df = spark.read.format("binaryFile") \
+        .option("pathGlobFilter", "*.pdf") \
+        .option("recursiveFileLookup", "true") \
+        .load(pdf_base_path)
+
+    # Extract text from each PDF
+    def extract_text(content):
+        try:
+            reader = PdfReader(io.BytesIO(content))
+            return "\n".join([p.extract_text() or "" for p in reader.pages])
+        except Exception:
+            return ""
+
+    extract_text_udf = F.udf(extract_text, T.StringType())
+
+    pdf_df = pdf_df.withColumn("raw_text", extract_text_udf(F.col("content"))) \
+                   .withColumn("ingest_ts", F.current_timestamp())
+
+    pdf_df.select("path", "content", "raw_text", "ingest_ts") \
+          .write.format("delta").mode("overwrite").option("overwriteSchema", "true") \
+          .saveAsTable(bronze_table)
+
+    print(f"✅ Bronze table {bronze_table} created successfully from {pdf_base_path}.")
+
