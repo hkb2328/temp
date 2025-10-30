@@ -1,0 +1,158 @@
+"""
+logger_setup.py
+Reusable, thread-safe logging utility for Databricks — stores logs in ADLS.
+"""
+
+import logging
+import queue
+from datetime import datetime
+from logging.handlers import QueueHandler, QueueListener
+from pyspark.sql import SparkSession
+
+
+def setup_logger(adls_path: str,
+                 log_prefix: str = "fusion",
+                 level=logging.INFO) -> logging.Logger:
+    """
+    Create a thread-safe logger that writes to ADLS and console.
+
+    Args:
+        adls_path (str): ADLS or DBFS folder path, e.g. "abfss://logs@<storage>.dfs.core.windows.net/"
+                         or "dbfs:/mnt/logs/"
+        log_prefix (str): File prefix for log file names.
+        level (int): Logging level.
+
+    Returns:
+        logging.Logger: Configured thread-safe logger.
+    """
+
+    # Create Spark session (needed for writing to ADLS)
+    spark = SparkSession.builder.getOrCreate()
+
+    # Generate log filename
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file_local = f"/tmp/{log_prefix}_{timestamp}.log"
+    log_file_adls = f"{adls_path.rstrip('/')}/{log_prefix}_{timestamp}.log"
+
+    # --- Configure queue-based logger (thread-safe) ---
+    log_queue = queue.Queue(-1)
+    file_handler = logging.FileHandler(log_file_local)
+    console_handler = logging.StreamHandler()
+
+    fmt = "%(asctime)s [%(threadName)s] %(levelname)s: %(message)s"
+    formatter = logging.Formatter(fmt)
+
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
+
+    queue_handler = QueueHandler(log_queue)
+    logger = logging.getLogger("FusionLogger")
+    logger.setLevel(level)
+    logger.addHandler(queue_handler)
+
+    listener = QueueListener(log_queue, file_handler, console_handler)
+    listener.start()
+    logger.listener = listener
+    logger.adls_log_file = log_file_adls
+
+    # --- Function to push logs to ADLS on shutdown ---
+    def flush_to_adls():
+        try:
+            spark._jsparkSession.sparkContext()._jsc.hadoopConfiguration().set(
+                "fs.azure.account.auth.type.<your-storage-account>.dfs.core.windows.net",
+                "OAuth"
+            )
+            # NOTE: credentials config depends on your ADLS mount or service principal setup.
+            # If using DBFS mount (/mnt/logs), no auth config needed.
+
+            dbutils = globals().get("dbutils") or __import__("pyspark.dbutils").dbutils
+            dbutils.fs.cp(f"file:{log_file_local}", log_file_adls)
+            logger.info(f"Log file uploaded to ADLS: {log_file_adls}")
+        except Exception as e:
+            print(f"⚠️ Failed to push log to ADLS: {e}")
+
+    # Attach method for later
+    logger.flush_to_adls = flush_to_adls
+
+    return logger
+=============================================================================================================================================================================================
+
+import os
+import time
+import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from logger_setup import setup_logger
+
+# === Configure your ADLS log folder ===
+ADLS_LOG_PATH = "abfss://logs@<your-storage-account>.dfs.core.windows.net/fusion-logs"
+# or use "dbfs:/mnt/logs/fusion-logs" if your container is mounted
+
+# Initialize global logger
+logger = setup_logger(ADLS_LOG_PATH, log_prefix="fusion_runtime")
+
+class Fusion_runtime:
+    def __init__(self, spark):
+        self.spark = spark
+
+    def process_object(self, each, run_id, env, max_retries=3, retry_wait=10):
+        object_name = each['object_name']
+        attempt = 0
+        logger.info(f"Processing started: {object_name}")
+
+        while attempt < max_retries:
+            try:
+                FusionLakeHousePipeline(self.spark, env).raw_ingest(
+                    object_name,
+                    each['query'],
+                    commonUtils(self.spark).load_schema(each['schema_path']),
+                    each['primary_key'],
+                    each['select_columns'],
+                    run_id,
+                    each.get('sensitive_columns', {})
+                )
+                logger.info(f"{object_name} succeeded on attempt {attempt + 1}")
+                self.spark.catalog.clearCache()
+                break
+            except Exception as exc:
+                attempt += 1
+                logger.error(f"{object_name} failed on attempt {attempt} with error: {exc}")
+                logger.debug(traceback.format_exc())
+                if attempt >= max_retries:
+                    logger.critical(f"{object_name} failed after {max_retries} attempts. Giving up.")
+                else:
+                    time.sleep(retry_wait)
+
+        self.spark.catalog.clearCache()
+        logger.info(f"Processing completed: {object_name}")
+
+if __name__ == "__main__":
+    try:
+        env = os.getenv("ENV", "DEV")
+        fusion_runtime = Fusion_runtime(spark)
+        run_id = fusion_runtime.generate_run_id()
+        fusion_objects_config = commonUtils(spark).load_yaml("fusion_config.yaml")
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [
+                executor.submit(fusion_runtime.process_object, each, run_id, env)
+                for each in fusion_objects_config['fusion_objects']
+                if each['object_name'] not in ("FF_Key_Contact__c",)
+            ]
+
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                    spark.catalog.clearCache()
+                except Exception as exc:
+                    logger.error(f"Thread execution failed: {exc}")
+                    logger.debug(traceback.format_exc())
+
+        logger.info("All threads completed successfully.")
+
+    except Exception as e:
+        logger.critical(f"Main execution failed: {e}")
+        logger.debug(traceback.format_exc())
+        raise
+    finally:
+        logger.listener.stop()
+        logger.flush_to_adls()
