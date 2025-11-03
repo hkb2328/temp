@@ -1,0 +1,65 @@
+from databricks_langchain import DatabricksEmbeddings, ChatDatabricks
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.vectorstores import FAISS
+import os
+
+# ---------- CONFIG ----------
+pdf_path = "/Workspace/Users/your.name@example.com/sample.pdf"  # Change path to your PDF file in Databricks
+embedding_endpoint = "databricks-bge-large-en"  # or whatever embedding endpoint you used earlier
+chat_endpoint = "databricks-dbrx-instruct"      # or "databricks-meta-llama-3-70b-instruct"
+# ----------------------------
+
+# 1️⃣ Load PDF
+loader = PyPDFLoader(pdf_path)
+docs = loader.load()
+print(f"✅ Loaded {len(docs)} pages from {pdf_path}")
+
+# 2️⃣ Split text into chunks
+splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+chunks = splitter.split_documents(docs)
+print(f"✅ Split into {len(chunks)} chunks")
+
+# 3️⃣ Create embeddings using Databricks model
+embedding_model = DatabricksEmbeddings(endpoint=embedding_endpoint)
+
+# 4️⃣ Create FAISS vector store (in-memory)
+vectorstore = FAISS.from_documents(chunks, embedding_model)
+retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+print("✅ FAISS index created")
+
+# 5️⃣ Initialize Databricks chat model
+llm = ChatDatabricks(endpoint=chat_endpoint)
+
+# 6️⃣ Define retrieval + generation manually (no chains)
+def rag_answer(query: str):
+    # Retrieve relevant chunks
+    retrieved_docs = retriever.get_relevant_documents(query)
+    context = "\n\n".join([doc.page_content for doc in retrieved_docs])
+
+    # Build prompt for the LLM
+    prompt = f"""
+    You are a helpful assistant. Use the following context to answer the question.
+
+    Context:
+    {context}
+
+    Question:
+    {query}
+
+    Answer:
+    """
+
+    # Call Databricks chat model
+    try:
+        response = llm.predict(prompt)
+    except Exception:
+        response = llm.invoke(prompt)
+
+    return response
+
+# 7️⃣ Test it
+question = "Summarize the key points of this document."
+answer = rag_answer(question)
+print("🔹Question:", question)
+print("🔹Answer:", answer)
