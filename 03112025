@@ -1,0 +1,86 @@
+from datetime import datetime
+
+class CustomLogger:
+    """
+    Databricks-compatible custom logger that writes log messages directly to ADLS.
+    Each log line is appended as text into a .log file stored in your ADLS container.
+    """
+
+    def __init__(self, spark, adls_base_path):
+        """
+        :param spark: Active SparkSession object
+        :param adls_base_path: Base ADLS path, e.g.
+               'abfss://raw@youraccount.dfs.core.windows.net/logs/fusion_pipeline_logs'
+        """
+        self.spark = spark
+        self.adls_base_path = adls_base_path
+
+    def _write_log(self, log_line, run_id):
+        """Internal helper to append a log line into ADLS."""
+        log_df = self.spark.createDataFrame([(log_line,)], ["log"])
+        adls_path = f"{self.adls_base_path}/run_id={run_id}/fusion_log_{datetime.now().strftime('%Y%m%d')}.log"
+        log_df.write.mode("append").text(adls_path)
+
+    def log(self, run_id, level, message, object_name=None, attempt=None):
+        """
+        Write a log entry to ADLS.
+        :param run_id: Unique pipeline run ID
+        :param level: INFO / ERROR / WARNING / DEBUG
+        :param message: Log message
+        :param object_name: Optional (for object-level logging)
+        :param attempt: Optional (retry attempt)
+        """
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_line = f"{timestamp} | {level.upper()} | run_id={run_id} | object={object_name or '-'} | attempt={attempt or '-'} | {message}"
+        self._write_log(log_line, run_id)
+
+
+=================================================================================================================================================
+
+
+from custom_logger import CustomLogger
+
+class Fusion_runtime:
+    def __init__(self, spark):
+        self.spark = spark
+        self.logger = CustomLogger(
+            spark,
+            "abfss://raw@<your-storage-account>.dfs.core.windows.net/logs/fusion_pipeline_logs"
+        )
+
+    def generate_run_id(self):
+        import uuid
+        from datetime import datetime
+        uid = uuid.uuid4()
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        return f"{timestamp}_{str(uid)[:8]}"
+
+    def process_object(self, each, run_id, env, max_retries=3, retry_wait=10):
+        object_name = each['object_name']
+        self.logger.log(run_id, "INFO", "Starting object ingestion", object_name)
+        attempt = 0
+
+        while attempt < max_retries:
+            try:
+                FusionLakeHousePipeline(self.spark, env).raw_ingest(
+                    object_name,
+                    each['query'],
+                    commonUtils(self.spark).load_schema(each['schema_path']),
+                    each['primary_key'],
+                    each['select_columns'],
+                    run_id,
+                    each.get('sensitive_columns', {})
+                )
+
+                self.logger.log(run_id, "INFO", f"Succeeded on attempt {attempt + 1}", object_name, attempt + 1)
+                self.spark.catalog.clearCache()
+                break
+
+            except Exception as e:
+                attempt += 1
+                self.logger.log(run_id, "ERROR", f"Failed attempt {attempt}: {e}", object_name, attempt)
+                if attempt >= max_retries:
+                    self.logger.log(run_id, "ERROR", f"Giving up after {max_retries} attempts", object_name)
+                else:
+                    import time
+                    time.sleep(retry_wait)
