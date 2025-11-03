@@ -3,20 +3,24 @@ import queue
 import json
 import time
 from datetime import datetime
+from pyspark.sql import SparkSession
 
 class AsyncADLSLogger:
     def __init__(self, log_dir, flush_interval=10, batch_size=20):
         """
-        log_dir: ADLS path, e.g. 'abfss://logs@<storage>.dfs.core.windows.net/pipeline_logs'
+        log_dir: ADLS path (e.g. abfss://logs@<storage>.dfs.core.windows.net/pipeline_logs)
+        flush_interval: seconds between log flushes
+        batch_size: max number of log records before auto-flush
         """
         self.log_dir = log_dir.rstrip("/")
-        self.flush_interval = flush_interval
-        self.batch_size = batch_size
+        self.flush_interval = float(flush_interval)
+        self.batch_size = int(batch_size)
         self.log_queue = queue.Queue()
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
 
+    # Background worker thread — collects and flushes logs
     def _worker(self):
         buffer = []
         while not self.stop_event.is_set() or not self.log_queue.empty():
@@ -26,7 +30,7 @@ class AsyncADLSLogger:
             except queue.Empty:
                 pass
 
-            # flush if enough logs collected or when stopping
+            # flush when buffer full or stopping
             if len(buffer) >= self.batch_size or (self.stop_event.is_set() and buffer):
                 try:
                     self._flush(buffer)
@@ -34,31 +38,32 @@ class AsyncADLSLogger:
                     print(f"[LOGGER] Flush failed: {e}")
                 buffer = []
 
+    # Flush logs to ADLS (append mode)
     def _flush(self, buffer):
         if not buffer:
             return
 
-        from pyspark.dbutils import DBUtils
-        from pyspark.sql import SparkSession
-
         spark = SparkSession.getActiveSession()
-        dbutils = DBUtils(spark)
+        if not spark:
+            raise RuntimeError("No active Spark session found")
 
-        date_str = datetime.utcnow().strftime("%Y%m%d")
-        timestamp_str = datetime.utcnow().strftime("%H%M%S")
-        log_file = f"{self.log_dir}/logs_{date_str}_{timestamp_str}.jsonl"
+        # Create Spark DF from log buffer
+        df = spark.createDataFrame(buffer)
 
-        content = "\n".join(json.dumps(r, ensure_ascii=False) for r in buffer) + "\n"
+        # Partition logs by date for organization
+        date_str = datetime.utcnow().strftime("%Y-%m-%d")
+        output_path = f"{self.log_dir}/date={date_str}"
 
-        # dbutils.fs.put supports overwrite; to append, we create new file per batch
-        dbutils.fs.put(log_file, content, overwrite=True)
+        # Append mode ensures incremental logs are added
+        df.write.mode("append").json(output_path)
 
+    # Logging helpers
     def log(self, level, message, run_id=None, object_name=None):
         record = {
             "timestamp": datetime.utcnow().isoformat(),
             "level": level,
-            "run_id": run_id,
-            "object_name": object_name,
+            "run_id": run_id or "",
+            "object_name": object_name or "",
             "message": message,
         }
         self.log_queue.put(record)
@@ -67,6 +72,7 @@ class AsyncADLSLogger:
     def error(self, msg, **kwargs): self.log("ERROR", msg, **kwargs)
     def warning(self, msg, **kwargs): self.log("WARNING", msg, **kwargs)
 
+    # Clean shutdown
     def stop(self):
         self.stop_event.set()
         self.thread.join(timeout=30)
