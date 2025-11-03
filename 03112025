@@ -37,50 +37,98 @@ class CustomLogger:
 
 =================================================================================================================================================
 
+import os
+import time
+import uuid
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from GR_DATAHUB.src.common.utils import commonUtils
+from GR_DATAHUB.src.fusion.medallion_pipeline import FusionLakeHousePipeline
 from custom_logger import CustomLogger
+
 
 class Fusion_runtime:
     def __init__(self, spark):
         self.spark = spark
+        # 👇 Update your ADLS container & storage account here
         self.logger = CustomLogger(
             spark,
-            "abfss://raw@<your-storage-account>.dfs.core.windows.net/logs/fusion_pipeline_logs"
+            "abfss://raw@<your-storage-account>.dfs.core.windows.net/logs/fusion_pipeline_logs",
         )
 
     def generate_run_id(self):
-        import uuid
-        from datetime import datetime
+        """Generate a unique run ID for each pipeline run."""
         uid = uuid.uuid4()
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         return f"{timestamp}_{str(uid)[:8]}"
 
     def process_object(self, each, run_id, env, max_retries=3, retry_wait=10):
-        object_name = each['object_name']
-        self.logger.log(run_id, "INFO", "Starting object ingestion", object_name)
+        """
+        Processes each fusion object with retries and logging.
+        """
+        object_name = each["object_name"]
+        query = each["query"]
+        schema_path = each["schema_path"]
+        select_columns = each["select_columns"]
+        primary_key = each["primary_key"]
+        sensitive_columns = each.get("sensitive_columns", {})
+
+        self.logger.log(run_id, "INFO", "Starting ingestion", object_name)
         attempt = 0
 
         while attempt < max_retries:
             try:
+                # Load schema and trigger ingestion
+                schema = commonUtils(self.spark).load_schema(schema_path)
                 FusionLakeHousePipeline(self.spark, env).raw_ingest(
-                    object_name,
-                    each['query'],
-                    commonUtils(self.spark).load_schema(each['schema_path']),
-                    each['primary_key'],
-                    each['select_columns'],
-                    run_id,
-                    each.get('sensitive_columns', {})
+                    object_name, query, schema, primary_key, select_columns, run_id, sensitive_columns
                 )
 
-                self.logger.log(run_id, "INFO", f"Succeeded on attempt {attempt + 1}", object_name, attempt + 1)
+                # Log success
+                self.logger.log(run_id, "INFO", f"Successfully ingested {object_name} on attempt {attempt + 1}", object_name, attempt + 1)
                 self.spark.catalog.clearCache()
                 break
 
             except Exception as e:
                 attempt += 1
-                self.logger.log(run_id, "ERROR", f"Failed attempt {attempt}: {e}", object_name, attempt)
+                err_msg = f"{object_name} failed on attempt {attempt} with error: {e}"
+                self.logger.log(run_id, "ERROR", err_msg, object_name, attempt)
+
                 if attempt >= max_retries:
-                    self.logger.log(run_id, "ERROR", f"Giving up after {max_retries} attempts", object_name)
+                    self.logger.log(run_id, "ERROR", f"{object_name} failed after {max_retries} retries.", object_name)
                 else:
-                    import time
                     time.sleep(retry_wait)
+
+
+# ============================================================
+#                   MAIN EXECUTION LOGIC
+# ============================================================
+
+if __name__ == "__main__":
+    try:
+        env = os.getenv("ENV", "DEV")
+        fusion_runtime = Fusion_runtime(spark)
+        run_id = fusion_runtime.generate_run_id()
+        fusion_objects_config = commonUtils(spark).load_yaml("fusion_config.yaml")
+
+        fusion_runtime.logger.log(run_id, "INFO", "Pipeline execution started")
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [
+                executor.submit(fusion_runtime.process_object, each, run_id, env)
+                for each in fusion_objects_config["fusion_objects"]
+            ]
+
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                    spark.catalog.clearCache()
+                except Exception as exc:
+                    fusion_runtime.logger.log(run_id, "ERROR", f"Thread execution failed: {exc}")
+
+        fusion_runtime.logger.log(run_id, "INFO", "Pipeline execution completed successfully")
+
+    except Exception as e:
+        fusion_runtime.logger.log(run_id, "CRITICAL", f"Pipeline crashed: {e}")
+        raise
