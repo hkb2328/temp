@@ -1,0 +1,86 @@
+from databricks_langchain import DatabricksEmbeddings, ChatDatabricks
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.vectorstores import FAISS
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
+import os
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+# PDF stored in ADLS
+pdf_path = "abfss://your-container@your-storage-account.dfs.core.windows.net/path/to/your.pdf"
+
+# Local temp file for loading PDF
+local_pdf_path = "/tmp/local_pdf.pdf"
+
+# Copy PDF from ADLS to local
+dbutils.fs.cp(pdf_path, f"file:{local_pdf_path}")
+
+# ============================================================
+# STEP 1: LOAD AND CHUNK PDF
+# ============================================================
+
+loader = PyPDFLoader(local_pdf_path)
+docs = loader.load()
+
+# Split into chunks for embedding
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+chunks = text_splitter.split_documents(docs)
+
+print(f"✅ Loaded {len(chunks)} chunks from PDF")
+
+# ============================================================
+# STEP 2: CREATE DATABRICKS EMBEDDINGS
+# ============================================================
+
+embeddings = DatabricksEmbeddings(endpoint="databricks-bge-large-en")
+
+# Create FAISS vector store in memory
+vector_store = FAISS.from_documents(chunks, embedding=embeddings)
+
+print("✅ Embeddings generated and stored in FAISS index")
+
+# ============================================================
+# STEP 3: SETUP RETRIEVAL QA WITH DATABRICKS LLM
+# ============================================================
+
+llm = ChatDatabricks(endpoint="databricks-meta-llama-3-70b-instruct")
+
+prompt_template = """
+You are a helpful assistant. Use the provided context to answer the question.
+If the answer is not in the context, say "I couldn't find the answer in the provided document."
+
+Context:
+{context}
+
+Question:
+{question}
+"""
+
+PROMPT = PromptTemplate(
+    template=prompt_template,
+    input_variables=["context", "question"]
+)
+
+qa_chain = RetrievalQA.from_chain_type(
+    llm=llm,
+    retriever=vector_store.as_retriever(),
+    chain_type="stuff",
+    chain_type_kwargs={"prompt": PROMPT}
+)
+
+# ============================================================
+# STEP 4: ASK QUESTION
+# ============================================================
+
+query = "Summarize the main points of this document."
+result = qa_chain.run(query)
+
+print("\n=========================")
+print("QUESTION:", query)
+print("=========================")
+print("ANSWER:", result)
+print("=========================")
