@@ -36,6 +36,9 @@ class AsyncADLSLogger:
                     self._flush(buffer)
                 except Exception as e:
                     print(f"[LOGGER] Flush failed: {e}")
+
+
+
                 buffer = []
 
     # Flush logs to ADLS (append mode)
@@ -73,6 +76,93 @@ class AsyncADLSLogger:
     def warning(self, msg, **kwargs): self.log("WARNING", msg, **kwargs)
 
     # Clean shutdown
+    def stop(self):
+        self.stop_event.set()
+        self.thread.join(timeout=30)
+======================================================
+
+import threading
+import queue
+import json
+import time
+from datetime import datetime
+from pyspark.sql import SparkSession
+
+class AsyncADLSFileLogger:
+    def __init__(self, log_dir, flush_interval=10, batch_size=20):
+        """
+        log_dir: ADLS path, e.g. abfss://logs@<storage>.dfs.core.windows.net/pipeline_logs
+        """
+        self.log_dir = log_dir.rstrip("/")
+        self.flush_interval = float(flush_interval)
+        self.batch_size = int(batch_size)
+        self.log_queue = queue.Queue()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+
+    def _worker(self):
+        buffer = []
+        last_flush = time.time()
+
+        while not self.stop_event.is_set() or not self.log_queue.empty():
+            try:
+                record = self.log_queue.get(timeout=self.flush_interval)
+                buffer.append(record)
+            except queue.Empty:
+                pass
+
+            # flush if buffer full or time passed
+            if (
+                len(buffer) >= self.batch_size
+                or (time.time() - last_flush >= self.flush_interval and buffer)
+                or (self.stop_event.is_set() and buffer)
+            ):
+                try:
+                    self._flush(buffer)
+                except Exception as e:
+                    print(f"[LOGGER] Flush failed: {e}")
+                buffer = []
+                last_flush = time.time()
+
+    def _flush(self, buffer):
+        if not buffer:
+            return
+
+        # Get a Spark session to access dbutils
+        spark = SparkSession.getActiveSession()
+        if not spark:
+            raise RuntimeError("No active Spark session found")
+
+        from pyspark.dbutils import DBUtils
+        dbutils = DBUtils(spark)
+
+        date_str = datetime.utcnow().strftime("%Y%m%d")
+        ts_str = datetime.utcnow().strftime("%H%M%S%f")[:-3]
+
+        # One file per flush batch
+        log_file = f"{self.log_dir}/logs_{date_str}_{ts_str}.jsonl"
+
+        # Convert all records to JSON lines
+        content = "\n".join(json.dumps(r, ensure_ascii=False) for r in buffer) + "\n"
+
+        # Write file directly to ADLS
+        dbutils.fs.put(log_file, content, overwrite=True)
+
+    def log(self, level, message, run_id=None, object_name=None):
+        record = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "level": level,
+            "run_id": run_id or "",
+            "object_name": object_name or "",
+            "message": message,
+        }
+        self.log_queue.put(record)
+
+    def info(self, msg, **kwargs): self.log("INFO", msg, **kwargs)
+    def error(self, msg, **kwargs): self.log("ERROR", msg, **kwargs)
+    def warning(self, msg, **kwargs): self.log("WARNING", msg, **kwargs)
+
     def stop(self):
         self.stop_event.set()
         self.thread.join(timeout=30)
