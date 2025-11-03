@@ -1,0 +1,45 @@
+# logger_setup.py
+
+from datetime import datetime
+
+class BufferedLogger:
+    def __init__(self, spark, adls_base_path, flush_interval=50):
+        """
+        Buffered ADLS logger that writes logs in batches.
+
+        Parameters:
+            spark: SparkSession object
+            adls_base_path: Base ADLS directory to store logs
+            flush_interval: Number of log messages to buffer before writing
+        """
+        self.spark = spark
+        self.adls_base_path = adls_base_path.rstrip("/")
+        self.buffer = []
+        self.flush_interval = flush_interval
+
+    def log(self, run_id, level, message, object_name=None, attempt=None):
+        """Add a log message to the buffer"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_line = (
+            f"{timestamp} | {level.upper()} | run_id={run_id} "
+            f"| object={object_name or '-'} | attempt={attempt or '-'} | {message}"
+        )
+        self.buffer.append((log_line,))
+
+        # Flush periodically
+        if len(self.buffer) >= self.flush_interval:
+            self.flush(run_id)
+
+    def flush(self, run_id):
+        """Write all buffered logs to ADLS"""
+        if not self.buffer:
+            return
+
+        adls_path = f"{self.adls_base_path}/run_id={run_id}/fusion_log_{datetime.now().strftime('%Y%m%d')}.log"
+        df = self.spark.createDataFrame(self.buffer, ["log"])
+        df.write.mode("append").text(adls_path)
+        self.buffer.clear()
+
+    def finalize(self, run_id):
+        """Force flush remaining logs"""
+        self.flush(run_id)
