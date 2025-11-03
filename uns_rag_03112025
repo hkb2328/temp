@@ -36,6 +36,8 @@ try:
 except ImportError:
     import sys, subprocess
     subprocess.check_call([sys.executable, "-m", "pip", "install", "PyPDF2"])
+
+
     from PyPDF2 import PdfReader
 
 def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
@@ -156,3 +158,62 @@ if __name__ == "__main__":
         ans = retrieve_and_generate(args.query, EMBEDDED_TABLE)
         print("\n=== ANSWER ===\n")
         print(ans)
+=================================================================================================================================================
+from pyspark.sql import SparkSession
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.vectorstores import FAISS
+from langchain.chains import RetrievalQA
+from langchain.llms import HuggingFacePipeline
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+
+# Initialize Spark
+spark = SparkSession.builder.appName("RAG_PDF_LOCAL").getOrCreate()
+
+# ===== 1️⃣ Load PDF from ADLS =====
+# Make sure your ADLS path is accessible via mount or abfss://
+pdf_path = "abfss://<container>@<storage-account>.dfs.core.windows.net/<path>/your_doc.pdf"
+loader = PyPDFLoader(pdf_path)
+docs = loader.load()
+
+# ===== 2️⃣ Split into chunks =====
+splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200)
+chunks = splitter.split_documents(docs)
+
+# ===== 3️⃣ Create local embeddings =====
+# Uses a lightweight model that runs locally, no API needed
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+# ===== 4️⃣ Store embeddings in FAISS =====
+vectorstore = FAISS.from_documents(chunks, embeddings)
+
+# ===== 5️⃣ Load a small local LLM =====
+# This uses the free DistilGPT-2 model from Hugging Face Hub (auto-downloaded)
+model_id = "distilgpt2"
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+model = AutoModelForCausalLM.from_pretrained(model_id)
+
+pipe = pipeline(
+    "text-generation",
+    model=model,
+    tokenizer=tokenizer,
+    max_new_tokens=200,
+    temperature=0.3
+)
+
+llm = HuggingFacePipeline(pipeline=pipe)
+
+# ===== 6️⃣ Build a RetrievalQA chain =====
+qa_chain = RetrievalQA.from_chain_type(
+    llm=llm,
+    retriever=vectorstore.as_retriever(search_kwargs={"k": 3}),
+    return_source_documents=False
+)
+
+# ===== 7️⃣ Ask your question =====
+query = "Summarize the main points of this document."
+result = qa_chain({"query": query})
+
+print("\n=== Answer ===\n")
+print(result["result"])
