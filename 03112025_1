@@ -1,0 +1,146 @@
+import threading
+import queue
+import json
+import os
+from datetime import datetime
+from pyspark.sql import SparkSession
+
+class AsyncLogger:
+    def __init__(self, spark, log_path, flush_interval=5):
+        self.spark = spark
+        self.log_path = log_path
+        self.log_queue = queue.Queue()
+        self.flush_interval = flush_interval
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+
+    def _worker(self):
+        buffer = []
+        while not self.stop_event.is_set() or not self.log_queue.empty():
+            try:
+                record = self.log_queue.get(timeout=self.flush_interval)
+                buffer.append(record)
+            except queue.Empty:
+                pass
+
+            if buffer:
+                self._flush_to_adls(buffer)
+                buffer = []
+
+    def _flush_to_adls(self, buffer):
+        # Convert to Spark DF and append
+        df = self.spark.createDataFrame(buffer)
+        (
+            df.write.mode("append")
+            .format("delta")
+            .save(self.log_path)
+        )
+
+    def log(self, level, message, run_id=None, object_name=None):
+        record = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "level": level,
+            "run_id": run_id,
+            "object_name": object_name,
+            "message": message
+        }
+        self.log_queue.put(record)
+
+    def info(self, msg, **kwargs): self.log("INFO", msg, **kwargs)
+    def error(self, msg, **kwargs): self.log("ERROR", msg, **kwargs)
+    def warning(self, msg, **kwargs): self.log("WARNING", msg, **kwargs)
+
+    def stop(self):
+        self.stop_event.set()
+        self.thread.join()
+
+============================================================================================================
+
+import os
+import uuid
+from datetime import datetime
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from GR_DATAHUB.src.constants.global_constants import global_config_constants
+from GR_DATAHUB.src.common.utils import commonUtils
+from GR_DATAHUB.src.fusion.medallion_pipeline import FusionLakeHousePipeline
+from custom_logger_async import AsyncLogger
+
+
+class Fusion_runtime:
+    def __init__(self, spark):
+        self.spark = spark
+        self.logger = AsyncLogger(spark, "abfss://logs@<your_storage_account>.dfs.core.windows.net/datalake_logs")
+
+    def generate_run_id(self):
+        uid = uuid.uuid4()
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        run_id = f"{timestamp}_{str(uid)[:8]}"
+        return run_id
+
+    def process_object(self, each, run_id, env, max_retries=3, retry_wait=10):
+        object_name = each['object_name']
+        query = each['query']
+        schema_path = each['schema_path']
+        schema = commonUtils(self.spark).load_yaml(schema_path)
+        select_columns = each['select_columns']
+        primary_key = each['primary_key']
+        sensitive_columns = each.get('sensitive_columns', {})
+        attempt = 0
+
+        self.logger.info(f"Processing {object_name}", run_id=run_id, object_name=object_name)
+        while attempt < max_retries:
+            try:
+                FusionLakeHousePipeline(self.spark, "DEV").raw_ingest(
+                    object_name, query, schema, primary_key, select_columns, run_id, sensitive_columns
+                )
+                msg = f"{object_name} succeeded on attempt {attempt + 1}"
+                print(msg)
+                self.logger.info(msg, run_id=run_id, object_name=object_name)
+                self.spark.catalog.clearCache()
+                break
+            except Exception as exc:
+                attempt += 1
+                msg = f"{object_name} failed on attempt {attempt} with error: {exc}"
+                print(msg)
+                self.logger.error(msg, run_id=run_id, object_name=object_name)
+
+                if attempt >= max_retries:
+                    msg = f"{object_name} failed after {max_retries} attempts. Giving up."
+                    print(msg)
+                    self.logger.error(msg, run_id=run_id, object_name=object_name)
+                else:
+                    time.sleep(retry_wait)
+
+        self.spark.catalog.clearCache()
+
+
+if __name__ == "__main__":
+    try:
+        env = os.getenv("ENV", "DEV")
+        spark = commonUtils().get_spark()  # adapt if you have a spark session already
+        fusion_runtime = Fusion_runtime(spark)
+        run_id = fusion_runtime.generate_run_id()
+
+        fusion_objects_config = commonUtils(spark).load_yaml("fusion_config.yaml")
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = []
+            for each in fusion_objects_config['fusion_objects']:
+                futures.append(executor.submit(fusion_runtime.process_object, each, run_id, env))
+
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                    spark.catalog.clearCache()
+                except Exception as exc:
+                    print(f"Exception occurred: {exc}")
+                    fusion_runtime.logger.error(f"Thread failed: {exc}", run_id=run_id)
+
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        fusion_runtime.logger.error(f"Fatal error in main: {e}", run_id="N/A")
+    finally:
+        fusion_runtime.logger.stop()
