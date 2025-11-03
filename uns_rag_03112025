@@ -1,9 +1,10 @@
 """
-Databricks RAG Pipeline (No Vector Index, using built-in GenAI models)
----------------------------------------------------------------------
-✅ Works entirely inside Databricks ML cluster
-✅ Uses built-in Databricks models (no REST calls)
-✅ Writes to Unity Catalog Delta table
+Databricks RAG Pipeline using built-in foundation_model API
+------------------------------------------------------------
+✅ Works with Databricks Runtime 16.4 LTS ML+
+✅ Uses official Databricks embedding & LLM models
+✅ No external API calls or tokens
+✅ Reads PDFs from ADLS and stores embeddings in a Delta table
 """
 
 import uuid
@@ -11,23 +12,23 @@ import numpy as np
 from io import BytesIO
 from typing import List
 from pyspark.sql import Row
-from pyspark.sql.functions import col, udf
+from pyspark.sql.functions import col
 from pyspark.sql.types import ArrayType, FloatType
 
 # ---------- CONFIG ----------
-PDF_FOLDER_PATH = "dbfs:/mnt/adls/path/to/pdfs/"  # your ADLS path
-EMBEDDED_TABLE = "your_catalog.your_schema.silver_embeddings"  # change this
+PDF_FOLDER_PATH = "dbfs:/mnt/adls/path/to/pdfs/"  # your ADLS folder
+EMBEDDED_TABLE = "your_catalog.your_schema.silver_embeddings"  # update this
 MAX_WORDS = 300
 OVERLAP = 50
 TOP_K = 5
 # ----------------------------
 
-# Import Databricks built-in GenAI library
-from databricks import genai
+# ✅ Import new Databricks GenAI interface
+from databricks.model_training import foundation_model as fm
 
-# Load embedding & generation models
-emb_model = genai.embeddings.get("databricks-bge-large-en")
-llm = genai.ChatModel("databricks-dbrx-instruct")
+# Load embedding & chat models
+emb_model = fm.create(name="databricks-bge-large-en")
+llm = fm.create(name="databricks-dbrx-instruct")
 
 # ---------- PDF Utilities ----------
 try:
@@ -38,13 +39,12 @@ except ImportError:
     from PyPDF2 import PdfReader
 
 def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
+    """Extract text from PDF bytes"""
     reader = PdfReader(BytesIO(pdf_bytes))
-    text = []
-    for page in reader.pages:
-        text.append(page.extract_text() or "")
-    return "\n".join(text)
+    return "\n".join(page.extract_text() or "" for page in reader.pages)
 
 def chunk_text(text: str, max_words=MAX_WORDS, overlap=OVERLAP) -> List[str]:
+    """Split long text into overlapping chunks"""
     words = text.split()
     chunks = []
     start = 0
@@ -59,24 +59,28 @@ def chunk_text(text: str, max_words=MAX_WORDS, overlap=OVERLAP) -> List[str]:
 
 # ---------- ADLS Utilities ----------
 def list_pdfs(folder_path: str):
+    """List all PDFs from ADLS folder"""
     return [f.path for f in dbutils.fs.ls(folder_path) if f.name.lower().endswith(".pdf")]
 
 def read_pdf_bytes(path: str) -> bytes:
+    """Read binary content of a PDF file"""
     df = spark.read.format("binaryFile").load(path)
     return bytes(df.collect()[0]["content"])
 
 # ---------- Embedding Creation ----------
 def process_and_store_embeddings(pdf_folder: str, embedded_table: str):
+    """Read PDFs, create chunks & embeddings, write to Delta table"""
     pdf_paths = list_pdfs(pdf_folder)
     all_rows = []
 
     for path in pdf_paths:
-        print(f"Processing {path}")
+        print(f"📄 Processing: {path}")
         raw = read_pdf_bytes(path)
         text = extract_text_from_pdf_bytes(raw)
         chunks = chunk_text(text)
 
-        embeddings = emb_model.embed_text(chunks)
+        # Generate embeddings for each chunk
+        embeddings = emb_model.predict(chunks)
         doc_id = path.replace("/", "_")
 
         for chunk, emb in zip(chunks, embeddings):
@@ -88,7 +92,7 @@ def process_and_store_embeddings(pdf_folder: str, embedded_table: str):
             ))
 
     if not all_rows:
-        print("⚠️ No chunks found.")
+        print("⚠️ No PDF text chunks found.")
         return
 
     df = spark.createDataFrame(all_rows)
@@ -99,12 +103,11 @@ def process_and_store_embeddings(pdf_folder: str, embedded_table: str):
 # ---------- Retrieval + Generation ----------
 def cosine_similarity(a: np.ndarray, b: np.ndarray):
     denom = (np.linalg.norm(a) * np.linalg.norm(b))
-    if denom == 0:
-        return 0.0
-    return float(np.dot(a, b) / denom)
+    return float(np.dot(a, b) / denom) if denom != 0 else 0.0
 
 def retrieve_top_k(query: str, embedded_table: str, top_k=TOP_K):
-    query_emb = np.array(emb_model.embed_text([query])[0])
+    """Retrieve top-k most relevant chunks for a query"""
+    query_emb = np.array(emb_model.predict([query])[0])
     df = spark.table(embedded_table).collect()
 
     scored = []
@@ -117,12 +120,13 @@ def retrieve_top_k(query: str, embedded_table: str, top_k=TOP_K):
     return top
 
 def retrieve_and_generate(query: str, embedded_table: str, top_k=TOP_K):
+    """Perform retrieval and generate LLM answer"""
     top_chunks = retrieve_top_k(query, embedded_table, top_k)
-    context = "\n\n".join([f"{r[2]}" for r in top_chunks])
+    context = "\n\n".join([r[2] for r in top_chunks])
 
     prompt = f"""
     You are a helpful assistant. Use the context below to answer the question.
-    If the answer is not in the context, say "I don't know".
+    If the answer is not in the context, say "I don't know."
 
     Context:
     {context}
@@ -131,16 +135,17 @@ def retrieve_and_generate(query: str, embedded_table: str, top_k=TOP_K):
     Answer:
     """
 
-    response = llm.chat(prompt)
-    return response
+    # Generate response
+    result = llm.predict(prompt)
+    return result
 
 # ---------- Main ----------
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Databricks RAG with built-in GenAI")
-    parser.add_argument("--create_embeddings", action="store_true")
-    parser.add_argument("--query", type=str, default=None)
+    parser = argparse.ArgumentParser(description="Databricks RAG with foundation_model API")
+    parser.add_argument("--create_embeddings", action="store_true", help="Process PDFs and create embeddings")
+    parser.add_argument("--query", type=str, default=None, help="Ask a question to the RAG model")
     args = parser.parse_args()
 
     if args.create_embeddings:
