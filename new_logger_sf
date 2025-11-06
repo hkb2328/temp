@@ -1,0 +1,104 @@
+import threading
+import queue
+import time
+import json
+from datetime import datetime
+from pyspark.dbutils import DBUtils
+
+class AsyncADLSFileLogger:
+    def __init__(self, spark, logs_dir, flush_interval=10, batch_size=20):
+        self.spark = spark
+        self.log_dir = logs_dir
+        self.flush_interval = float(flush_interval)
+        self.batch_size = int(batch_size)
+        self.log_queue = queue.Queue()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+
+    def _worker(self):
+        try:
+            buffer = []
+            last_flush = time.time()
+
+            while not self.stop_event.is_set() or not self.log_queue.empty():
+                try:
+                    record = self.log_queue.get(timeout=self.flush_interval)
+                    buffer.append(record)
+                except queue.Empty:
+                    pass
+
+                # flush if buffer full or time exceeded
+                if (
+                    len(buffer) >= self.batch_size
+                    or (time.time() - last_flush >= self.flush_interval and buffer)
+                    or (self.stop_event.is_set() and buffer)
+                ):
+                    try:
+                        # group records by (object_name, status)
+                        grouped = {}
+                        for rec in buffer:
+                            key = (rec.get("object_name", "unknown"), rec.get("status", "unknown"))
+                            grouped.setdefault(key, []).append(rec)
+
+                        # flush each group separately
+                        for (obj_name, status), recs in grouped.items():
+                            self._flush(recs, obj_name, status)
+
+                    except Exception as e:
+                        print(f"[LOGGER] Flush failed: {e}")
+                    buffer = []
+                    last_flush = time.time()
+
+        except Exception as e:
+            print(f"Logger Worker Error: {e}")
+
+    def _flush(self, buffer, object_name, status):
+        try:
+            if not buffer:
+                return
+
+            dbutils = DBUtils(self.spark)
+
+            date_str = datetime.utcnow().strftime("%Y%m%d")
+            ts_str = datetime.utcnow().strftime("%H%M%S%f")
+
+            # Folder structure: logs_dir/status/object_name/date/logs_...
+            log_folder = f"{self.log_dir}/{status}/{object_name}/{date_str}"
+            log_file = f"{log_folder}/logs_{ts_str[:-3]}.jsonl"
+
+            # Convert all records to JSON lines
+            content = "\n".join(json.dumps(r, ensure_ascii=False) for r in buffer) + "\n"
+
+            # Write directly to ADLS
+            dbutils.fs.put(log_file, content, overwrite=True)
+
+        except Exception as e:
+            print(f"Logger Flush Error: {e}")
+
+    def log(self, level, message, run_id=None, object_name=None, status="unknown"):
+        record = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "level": level,
+            "run_id": run_id or "",
+            "object_name": object_name or "",
+            "status": status,
+            "message": message,
+        }
+        self.log_queue.put(record)
+
+    def info(self, msg, **kwargs):
+        self.log("INFO", msg, **kwargs)
+
+    def error(self, msg, **kwargs):
+        self.log("ERROR", msg, **kwargs)
+
+    def warning(self, msg, **kwargs):
+        self.log("WARNING", msg, **kwargs)
+
+    def stop(self):
+        try:
+            self.stop_event.set()
+            self.thread.join(timeout=30)
+        except Exception as e:
+            print(f"Logger Stop Error: {e}")
