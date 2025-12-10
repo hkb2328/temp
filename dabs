@@ -1,0 +1,26 @@
+Databricks Asset Bundles:
+Databricks CLI installation:
+Execute below in windows termial
+winget search databricks
+winget install Databricks.DatabricksCLI
+databricks -v or databricks version  to confirm whether successfully installed or not.
+Install uv which is package manager just like PIP  pip install uv 
+
+
+From databricks cli to communicate to databricks workspace.. we need to authenticate.. we have 2 types. i. U2M (user to machine) ii. M2M(Machine to machine authentication)
+
+From local “databricks auth <https workspace url/ >  Then add databricks profile name,
+Confirm auth using  databricks auth profiles 
+*****creating bundle folder structure*****
+Initialize databricks bundle using  databricks bundle init  
+Created dabs_tut folder it has many folder created by defealut when we initialized this bundle.
+You get to see .databricks folder n scratch folder after you run “databricks bundle validate”. These folders are useful for production deployments. 
+Will look at each folder in detail:
+.databricks   it is the transactional logs for this bundle. Used when deployments
+Resources   remove all files under this folder
+scratch   scratch is shortform for scratch pad. That is like you don’t want to track that folder but you want to do some analysis.. and this folder is ignored in out .gitignore file 
+src   this folder contains all your sourcecode. Delete all files n folders from this folder.. we create code files manually. Create notebooks  to keep all py files 
+Test  remove all files n folders from this.. 
+
+
+
